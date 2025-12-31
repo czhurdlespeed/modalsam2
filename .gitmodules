@@ -1,0 +1,4 @@
+[submodule "sam2"]
+	path = sam2
+	url = https://github.com/ORNLxUTK/sam2.git
+	branch = FastAPI
