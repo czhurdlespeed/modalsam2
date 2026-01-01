@@ -1,0 +1,12 @@
+[project]
+name = "modalsam2"
+version = "0.1.0"
+requires-python = "<=3.13,>=3.10"
+dependencies = [
+    "sam-2[dev]",
+]
+
+
+[tool.uv.sources]
+sam-2 = { path = "./sam2", editable = true }
+

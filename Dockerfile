@@ -5,7 +5,6 @@ FROM ${BASE_IMAGE}
 ENV APP_ROOT=/opt/sam2
 ENV PYTHONUNBUFFERED=1
 ENV SAM2_BUILD_ALLOW_ERRORS=0
-ENV MODEL_SIZE=${MODEL_SIZE}
 ENV CUDA_HOME=/usr/local/cuda
 ENV UV_SYSTEM_PYTHON=1
 ENV UV_PROJECT_ENVIRONMENT=/opt/conda
@@ -43,7 +42,6 @@ WORKDIR ${APP_ROOT}/sam2
 
 # Building SAM 2 CUDA extension
 RUN uv sync -v
-RUN uv add modal "fastapi[standard-no-fastapi-cloud-cli]" peft
 
 # Download SAM 2.1 checkpoints
 ADD https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt ${APP_ROOT}/checkpoints/sam2.1_hiera_tiny.pt
