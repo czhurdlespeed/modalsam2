@@ -8,5 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
-SAM2images
+data/
 .env
