@@ -1,16 +1,22 @@
 import os
 import shutil
+import uuid
 import zipfile
 from pathlib import Path
 
 import modal
 from dotenv import load_dotenv
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from omegaconf import OmegaConf
 
 from .baseimage import BASE_IMAGE
 from .cloud import CloudBucket
+from .config import ModelYamlConfig, UserJob, UserSelections, create_cfg
 
 load_dotenv()
 
+auth_scheme = HTTPBearer()
 
 app = modal.App(name="sam2modalwebapp")
 
@@ -23,6 +29,8 @@ r2_secret = modal.Secret.from_name(
         "CF_R2_BUCKET_NAME",
     ],
 )
+
+token_secret = modal.Secret.from_name("token", required_keys=["AUTH_TOKEN"])
 
 data_volume = modal.Volume.from_name("sam2_input_data")
 checkpoint_volume = modal.Volume.from_name(
@@ -37,25 +45,41 @@ checkpoint_volume = modal.Volume.from_name(
         "/data": data_volume,
         "/trainingresults": checkpoint_volume,
     },
-    secrets=[r2_secret],
+    secrets=[r2_secret, token_secret],
     timeout=7200,
 )
+@modal.fastapi_endpoint(method="POST")
 async def train(
-    config_path: str = "sam2.1_training/MAZAK_LoRA4_tiny",
-    experiment_name: str = "sam2_training_run1",
-    gpu: str = "L40s",
+    userselections: UserSelections,
+    token: HTTPAuthorizationCredentials = Depends(auth_scheme),
 ):
     """
     Args:
-        config_path: Config name (without .yaml extension) relative to sam2/sam2/configs/
-                    e.g., "sam2.1_training/MAZAK_LoRA4_tiny"
-        experiment_name: Name for the experiment (used for log/checkpoint dirs)
+        userselections: User selections for the training
+        token: Authorization token
     """
+    if token.credentials != os.getenv("AUTH_TOKEN"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    cfg = create_cfg(
+        ModelYamlConfig(
+            userselections=userselections,
+            userjob=UserJob(user_id=uuid.uuid4().hex, job_id=1),
+            use_cluster=False,
+            dataset="irPOLYMER",
+            base_model="tiny",
+            num_epochs=1,
+        )
+    )
+
     import logging
 
-    from hydra import compose, initialize_config_module
+    from hydra import initialize_config_module
     from iopath.common.file_io import g_pathmgr
-    from omegaconf import OmegaConf
     from training.train import single_node_runner
     from training.utils.train_utils import makedir, register_omegaconf_resolvers
 
@@ -63,21 +87,7 @@ async def train(
     register_omegaconf_resolvers()
 
     logging.basicConfig(level=logging.INFO)
-    cfg = compose(config_name=config_path)
-    experiment_dir = f"/trainingresults/{experiment_name}"
-    makedir(experiment_dir)
-    cfg.launcher.experiment_log_dir = experiment_dir
-    cfg.launcher.num_nodes = 1
-    num_gpus = 1 if ":" not in gpu else int(gpu.split(":")[1])
-    cfg.launcher.gpus_per_node = num_gpus
-    cfg.submitit.use_cluster = False
-
-    cfg.dataset.img_folder = "/data/SAM2images/irPOLYMER/JPEGImages/train"
-    cfg.dataset.gt_folder = "/data/SAM2images/irPOLYMER/Annotations/train"
-    cfg.trainer.checkpoint.model_weight_initializer.state_dict.checkpoint_path = (
-        "/sam2modalwebapp/sam2/checkpoints/sam2.1_hiera_tiny.pt"
-    )
-    cfg.scratch.num_epochs = 1
+    makedir(cfg.launcher.experiment_log_dir)
 
     with g_pathmgr.open(
         os.path.join(cfg.launcher.experiment_log_dir, "config.yaml"), "w"
@@ -97,41 +107,42 @@ async def train(
     checkpoint_volume.commit()
     logging.info("Checkpoints committed to volume")
 
-    with zipfile.ZipFile(Path(f"/trainingresults/{experiment_name}.zip"), "w") as zip:
-        for file in Path(experiment_dir).rglob("*"):
+    zip_path = Path(
+        f"{Path(cfg.launcher.experiment_log_dir).parent / Path(cfg.launcher.experiment_log_dir).name}/checkpoint.zip"
+    )
+
+    with zipfile.ZipFile(zip_path, "w") as zip:
+        for file in Path(cfg.launcher.experiment_log_dir).rglob("*"):
             if file.is_file():
-                zip.write(file, file.relative_to(experiment_dir))
+                zip.write(file, file.relative_to(cfg.launcher.experiment_log_dir))
                 logging.info(f"Added {file} to {zip.filename}")
 
-    shutil.rmtree(f"/trainingresults/{experiment_name}")
-    logging.info(f"Successfully removed {experiment_dir}")
     cloudbucket = CloudBucket(bucket_name=os.getenv("CF_R2_BUCKET_NAME"))
-    logging.info(f"Uploading {experiment_name}.zip to R2 bucket")
+    logging.info(f"Uploading {zip_path} to R2 bucket")
     try:
         await cloudbucket.upload_file(
-            Path(f"/trainingresults/{experiment_name}.zip"), f"{experiment_name}.zip"
+            str(zip_path), str(zip_path.relative_to("/trainingresults"))
         )
     except Exception as e:
-        logging.error(f"Error uploading {experiment_name}.zip to R2 bucket: {e}")
+        logging.error(f"Error uploading {zip_path} to R2 bucket: {e}")
         raise e
-    finally:
-        Path(f"/trainingresults/{experiment_name}.zip").unlink()
-        logging.info(f"Successfully removed {experiment_name}.zip from Modal Volume")
 
+    logging.info(f"Successfully copied {zip_path} to {os.getenv('CF_R2_BUCKET_NAME')}")
+    shutil.rmtree(Path(cfg.launcher.experiment_log_dir).parent)
     logging.info(
-        f"Successfully copied {experiment_dir} to {os.getenv('CF_R2_BUCKET_NAME')}"
+        f"Successfully cleaned user {Path(cfg.launcher.experiment_log_dir).parent.name} job {Path(cfg.launcher.experiment_log_dir).name} from Modal Volume"
     )
 
 
-@app.local_entrypoint()
-def main(
-    config: str = "configs/sam2.1_training/MAZAK_LoRA4_tiny",
-    experiment_name: str = "sam2_training_run1",
-):
-    """
-    Local entrypoint to launch training.
+# @app.local_entrypoint()
+# def main(
+#     config: str = "configs/sam2.1_training/MAZAK_LoRA4_tiny",
+#     experiment_name: str = "sam2_training_run1",
+# ):
+#     """
+#     Local entrypoint to launch training.
 
-    Usage:
-        modal run main.py --config "configs/sam2.1_training/MAZAK_LoRA4_tiny" --experiment-name "my_run"
-    """
-    train.remote(config, experiment_name)
+#     Usage:
+#         modal run main.py --config "configs/sam2.1_training/MAZAK_LoRA4_tiny" --experiment-name "my_run"
+#     """
+#     train.remote(config, experiment_name)
