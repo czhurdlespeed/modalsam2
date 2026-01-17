@@ -15,7 +15,6 @@ from omegaconf import OmegaConf
 from .baseimage import BASE_IMAGE
 from .cloud import CloudBucket
 from .config import ModelYamlConfig, UserJob, UserSelections, create_cfg
-from .streamlogs import stream_log_file
 
 load_dotenv()
 
@@ -78,9 +77,8 @@ def launch_training(cfg: OmegaConf):
 
     main_port = 29500
 
-    single_node_runner(cfg, main_port, modal_volume=checkpoint_volume)
+    yield from single_node_runner(cfg, main_port)
     checkpoint_volume.commit()
-    logging.info("Modal Volume Final Commit: Training completed")
 
     zip_path = Path(
         f"{Path(cfg.launcher.experiment_log_dir).parent / Path(cfg.launcher.experiment_log_dir).name}/checkpoint.zip"
@@ -125,7 +123,6 @@ def launch_training(cfg: OmegaConf):
 @app.function(
     image=BASE_IMAGE,
     secrets=[token_secret],
-    volumes={"/trainingresults": checkpoint_volume},
 )
 @modal.fastapi_endpoint(method="POST")
 async def train(
@@ -149,15 +146,8 @@ async def train(
             userjob=UserJob(user_id=uuid.uuid4().hex, job_id=1),
         )
     )
-    function_object = launch_training.spawn(cfg=cfg)
-
-    async def generate_logs():
-        async for log_line in stream_log_file(
-            Path(cfg.launcher.experiment_log_dir), modal_volume=checkpoint_volume
-        ):
-            yield log_line + "\n"
 
     return StreamingResponse(
-        generate_logs(),
-        media_type="application/x-ndjson",
+        launch_training.remote_gen(cfg=cfg),
+        media_type="text/event-stream",
     )
