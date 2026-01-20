@@ -17,6 +17,18 @@ class UserSelections(BaseModel):
     dataset: Literal["irPOLYMER", "visPOLYMER", "TIG", "MAZAK"]
     num_epochs: Annotated[int, Field(ge=1, le=100)]
 
+    @computed_field
+    @property
+    def gpu_type(self) -> str:
+        if self.fullfinetune:
+            return "A100-80GB"
+        # LoRA cases
+        match self.base_model:
+            case "tiny" | "small":
+                return "L40S"
+            case "base_plus" | "large":
+                return "A100-80GB"
+
 
 class ModelYamlConfig(BaseModel):
     userselections: UserSelections
@@ -63,19 +75,6 @@ class ModelYamlConfig(BaseModel):
             return f"/sam2modalwebapp/sam2/sam2/configs/sam2.1_training/{{DATASET}}_LoRA_{self.userselections.base_model}.yaml"
         else:
             raise ValueError("Either fullfinetune or lora_rank must be set")
-
-    @computed_field
-    @property
-    def gpu_type(self) -> str:
-        match self.userselections.base_model:
-            case "tiny" | "small":
-                if self.num_gpus > 1:
-                    return f"L40S:{self.num_gpus}"
-                return "L40S"
-            case "base_plus" | "large":
-                if self.num_gpus > 1:
-                    return f"A100-80GB:{self.num_gpus}"
-                return "A100-80GB"
 
 
 def create_cfg(cfg: ModelYamlConfig) -> OmegaConf:
