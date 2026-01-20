@@ -10,9 +10,8 @@ from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer
 from modal import Dict
-from omegaconf import OmegaConf
 
-from .config import ModelYamlConfig, UserJob, UserSelections, create_cfg
+from .config import ModelYamlConfig, UserSelections
 from .containerimages import FASTAPI_LIGHTWEIGHT_IMAGE, SAM2_BASE_IMAGE
 
 load_dotenv()
@@ -31,6 +30,8 @@ r2_secret = modal.Secret.from_name(
     ],
 )
 
+logfire_secret = modal.Secret.from_name(name="logfire", required_keys=["LOGFIRE_TOKEN"])
+
 
 data_volume = modal.Volume.from_name("sam2_input_data")
 checkpoint_volume = modal.Volume.from_name(
@@ -47,21 +48,22 @@ job_queue = Dict.from_name("job-queue", create_if_missing=True)
     secrets=[r2_secret],
     timeout=7200,
 )
-def launch_training(userselections: UserSelections, userjob: UserJob):
+def launch_training(userselections: UserSelections):
     """Synchronous function to run training in background."""
     import logging
 
     from hydra import initialize_config_module
     from iopath.common.file_io import g_pathmgr
+    from omegaconf import OmegaConf
     from training.train import single_node_runner
     from training.utils.train_utils import makedir, register_omegaconf_resolvers
 
     from .cloud import CloudBucket
+    from .config import create_cfg
 
     cfg = create_cfg(
         ModelYamlConfig(
             userselections=userselections,
-            userjob=userjob,
         )
     )
 
@@ -128,7 +130,9 @@ def launch_training(userselections: UserSelections, userjob: UserJob):
     )
 
     try:
-        user_plus_job_id = f"{userjob.user_id}_{userjob.job_id}"
+        user_plus_job_id = (
+            f"{userselections.userjob.user_id}_{userselections.userjob.job_id}"
+        )
         if user_plus_job_id in job_queue:
             job_queue.pop(user_plus_job_id)
             logging.info(
@@ -142,6 +146,7 @@ def launch_training(userselections: UserSelections, userjob: UserJob):
 
 @app.function(
     image=FASTAPI_LIGHTWEIGHT_IMAGE,
+    secrets=[logfire_secret],
 )
 @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
 async def train(
@@ -151,20 +156,31 @@ async def train(
     Args:
         userselections: User selections for the training
     """
-    user_job = UserJob(user_id="Calvin", job_id=1)
-    user_plus_job_id = f"{user_job.user_id}_{user_job.job_id}"
-    try:
-        job_queue[user_plus_job_id] = modal.current_function_call_id()
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error adding job {user_plus_job_id} to queue: {str(e)}",
-        )
+    import logfire
 
-    return StreamingResponse(
-        launch_training.remote_gen(userselections=userselections, userjob=user_job),
-        media_type="text/event-stream",
-    )
+    logfire.configure(service_name=app.name)
+    with logfire.span(
+        f"Creating training job for user {userselections.userjob.user_id} job {userselections.userjob.job_id}"
+    ):
+        user_plus_job_id = (
+            f"{userselections.userjob.user_id}_{userselections.userjob.job_id}"
+        )
+        with logfire.span("Adding job to queue"):
+            try:
+                job_queue[user_plus_job_id] = modal.current_function_call_id()
+                logfire.info(f"Job {user_plus_job_id} added to queue")
+            except Exception as e:
+                logfire.error(f"Error adding job {user_plus_job_id} to queue: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error adding job {user_plus_job_id} to queue: {str(e)}",
+                )
+
+        with logfire.span("Launching training...🚀"):
+            return StreamingResponse(
+                launch_training.remote_gen(userselections=userselections),
+                media_type="text/event-stream",
+            )
 
 
 @app.function(

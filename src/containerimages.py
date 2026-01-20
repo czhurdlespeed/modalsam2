@@ -39,5 +39,12 @@ SAM2_BASE_IMAGE = (
 )
 
 FASTAPI_LIGHTWEIGHT_IMAGE = modal.Image.debian_slim(
-    python_version="3.11"
-).uv_pip_install(["fastapi[standard-no-fastapi-cloud-cli]", "hydra-core", "modal"])
+    python_version="3.13"
+).uv_pip_install(
+    [
+        "fastapi[standard-no-fastapi-cloud-cli]",
+        "modal",
+        "logfire[fastapi]",
+        "hydra-core",
+    ]
+)

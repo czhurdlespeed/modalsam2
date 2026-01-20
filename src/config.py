@@ -10,6 +10,7 @@ class UserJob(BaseModel):
 
 
 class UserSelections(BaseModel):
+    userjob: UserJob
     fullfinetune: bool
     lora_rank: Literal[2, 4, 8, 16, 32] | None
     base_model: Literal["tiny", "small", "base_plus", "large"]
@@ -19,7 +20,6 @@ class UserSelections(BaseModel):
 
 class ModelYamlConfig(BaseModel):
     userselections: UserSelections
-    userjob: UserJob
     use_cluster: bool = False
     num_nodes: int = 1
     gpus_per_node: int = 1
@@ -28,7 +28,7 @@ class ModelYamlConfig(BaseModel):
     @property
     def experiment_dir(self) -> str:
         """Auto-generated from userjob."""
-        return f"/trainingresults/{self.userjob.user_id}/{self.userjob.job_id}"
+        return f"/trainingresults/{self.userselections.userjob.user_id}/{self.userselections.userjob.job_id}"
 
     @computed_field
     @property
@@ -97,6 +97,11 @@ def create_cfg(cfg: ModelYamlConfig) -> OmegaConf:
         base_cfg.trainer.LoRA.adapter_name = (
             f"SAM2_LoRA{cfg.userselections.lora_rank}_{cfg.userselections.base_model}"
         )
-    base_cfg["userjob"] = "_".join([str(cfg.userjob.user_id), str(cfg.userjob.job_id)])
+    base_cfg["userjob"] = "_".join(
+        [
+            str(cfg.userselections.userjob.user_id),
+            str(cfg.userselections.userjob.job_id),
+        ]
+    )
 
     return base_cfg
