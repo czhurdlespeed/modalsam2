@@ -1,6 +1,6 @@
 import modal
 
-BASE_IMAGE = (
+SAM2_BASE_IMAGE = (
     modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel")
     .env(
         {
@@ -37,3 +37,7 @@ BASE_IMAGE = (
     .workdir("/sam2modalwebapp")
     .add_local_dir("sam2/", remote_path="/sam2modalwebapp/sam2/")
 )
+
+FASTAPI_LIGHTWEIGHT_IMAGE = modal.Image.debian_slim(
+    python_version="3.11"
+).uv_pip_install(["fastapi[standard-no-fastapi-cloud-cli]", "hydra-core", "modal"])

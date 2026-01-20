@@ -97,5 +97,6 @@ def create_cfg(cfg: ModelYamlConfig) -> OmegaConf:
         base_cfg.trainer.LoRA.adapter_name = (
             f"SAM2_LoRA{cfg.userselections.lora_rank}_{cfg.userselections.base_model}"
         )
+    base_cfg["userjob"] = "_".join([str(cfg.userjob.user_id), str(cfg.userjob.job_id)])
 
     return base_cfg
