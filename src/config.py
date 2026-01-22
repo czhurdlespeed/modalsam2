@@ -5,8 +5,21 @@ from pydantic import BaseModel, Field, computed_field
 
 
 class UserJob(BaseModel):
-    user_id: str
-    job_id: int
+    user_id: str = Field(..., min_length=1, max_length=255)
+    job_id: int = Field(..., ge=1)
+
+    def model_post_init(self, __context) -> None:
+        """Validate user_id to prevent path traversal and injection attacks."""
+        # Prevent path traversal and injection attacks
+        if ".." in self.user_id or "/" in self.user_id or "\\" in self.user_id:
+            raise ValueError("user_id contains invalid characters")
+        # Only allow alphanumeric, hyphens, and underscores
+        if not all(c.isalnum() or c in "-_" for c in self.user_id):
+            raise ValueError(
+                "user_id must contain only alphanumeric characters, hyphens, and underscores"
+            )
+        if not self.user_id or len(self.user_id.strip()) == 0:
+            raise ValueError("user_id cannot be empty")
 
 
 class UserSelections(BaseModel):

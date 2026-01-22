@@ -51,6 +51,8 @@ class SAM2Training:
     @modal.method(is_generator=True)
     def launch_training(self, userselections: UserSelections):
         """Synchronous function to run training in background."""
+        import re
+
         import logfire
         from hydra import initialize_config_module
         from iopath.common.file_io import g_pathmgr
@@ -116,7 +118,7 @@ class SAM2Training:
             try:
                 asyncio.run(
                     cloudbucket.upload_file(
-                        str(zip_path), str(zip_path.relative_to("/trainingresults"))
+                        zip_path, str(zip_path.relative_to("/trainingresults"))
                     )
                 )
             except Exception as e:
@@ -140,20 +142,26 @@ class SAM2Training:
                 user_plus_job_id = (
                     f"{userselections.userjob.user_id}_{userselections.userjob.job_id}"
                 )
-                if user_plus_job_id in job_queue:
-                    job_queue.pop(user_plus_job_id)
-                    logfire.info(
-                        f"Job {user_plus_job_id} removed from queue after training completion"
+                if re.match(r"^[a-zA-Z0-9_-]+$", user_plus_job_id):
+                    if user_plus_job_id in job_queue:
+                        job_queue.pop(user_plus_job_id)
+                        logfire.info(
+                            f"Job {user_plus_job_id} removed from queue after training completion"
+                        )
+                else:
+                    logfire.warning(
+                        f"Invalid user_plus_job_id format, skipping queue removal: {user_plus_job_id}"
                     )
             except Exception as e:
                 logfire.error(
-                    f"Error removing job {user_plus_job_id} from queue after training completion: {str(e)}"
+                    f"Error removing job from queue after training completion: {str(e)}"
                 )
 
 
 @app.function(
     image=FASTAPI_LIGHTWEIGHT_IMAGE,
     secrets=[logfire_secret],
+    timeout=7200,
 )
 @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
 async def train(
@@ -202,44 +210,104 @@ async def train(
     image=FASTAPI_LIGHTWEIGHT_IMAGE,
     volumes={"/trainingresults": checkpoint_volume},
     secrets=[logfire_secret],
+    timeout=60,  # 1 minute timeout for cancel endpoint
 )
 @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
 def cancel_job(user_plus_job_id: str):
+    import re
+
     import logfire
 
     logfire.configure(service_name="fastapi")
+
+    # Validate user_plus_job_id format to prevent injection attacks
+    if not re.match(r"^[a-zA-Z0-9_-]+$", user_plus_job_id):
+        logfire.error(f"Invalid user_plus_job_id format: {user_plus_job_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid user or job ID format",
+        )
+
     with logfire.span(f"Cancelling job {user_plus_job_id}"):
-        if user_plus_job_id not in job_queue:
-            logfire.error(f"Job {user_plus_job_id} not found in queue")
+        # Split user_plus_job_id safely - user_id may contain underscores
+        # We split from the right to get job_id (which is numeric) and user_id (which may contain underscores)
+        parts = user_plus_job_id.rsplit("_", 1)
+        if len(parts) != 2:
+            logfire.error(f"Invalid user_plus_job_id format: {user_plus_job_id}")
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User's job not found",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user or job ID format",
+            )
+        user_dir, job_id = parts
+
+        # Validate job_id is numeric
+        if not job_id.isdigit():
+            logfire.error(f"Invalid job_id format: {job_id}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid job ID format",
             )
 
-        with logfire.span("Cancelling job"):
-            try:
-                modal.FunctionCall.from_id(
-                    job_queue[user_plus_job_id]["func_id"]
-                ).cancel(terminate_containers=True)
-                job_queue.pop(user_plus_job_id)
-                logfire.info(f"Job {user_plus_job_id} cancelled successfully")
-                assert user_plus_job_id not in job_queue, (
-                    f"Job {user_plus_job_id} still in queue after cancellation"
-                )
-            except Exception as e:
-                logfire.error(f"Error cancelling job {user_plus_job_id}: {str(e)}")
+        # Try to cancel the job if it's in the queue
+        job_cancelled = False
+        if user_plus_job_id in job_queue:
+            with logfire.span("Cancelling job"):
+                try:
+                    modal.FunctionCall.from_id(
+                        job_queue[user_plus_job_id]["func_id"]
+                    ).cancel(terminate_containers=True)
+                    job_queue.pop(user_plus_job_id)
+                    job_cancelled = True
+                    logfire.info(f"Job {user_plus_job_id} cancelled successfully")
+                    assert user_plus_job_id not in job_queue, (
+                        f"Job {user_plus_job_id} still in queue after cancellation"
+                    )
+                except Exception as e:
+                    logfire.error(f"Error cancelling job {user_plus_job_id}: {str(e)}")
+                    # Continue to cleanup even if cancel failed
+        else:
+            logfire.warning(
+                f"Job {user_plus_job_id} not found in queue - may not have started yet"
+            )
+
+        # Always try to clean up the volume, even if job wasn't in queue
+        # This handles cases where:
+        # 1. Job was cancelled before it was added to queue
+        # 2. Job directory exists from a previous failed attempt
+        # 3. Job started but wasn't added to queue yet
+        with logfire.span("Cleaning up Modal Volume"):
+            checkpoint_volume.reload()
+            # Validate path to prevent directory traversal
+            safe_user_dir = (
+                user_dir.replace("..", "").replace("/", "").replace("\\", "")
+            )
+            safe_job_id = job_id.replace("..", "").replace("/", "").replace("\\", "")
+            cleanup_path = Path(f"/trainingresults/{safe_user_dir}/{safe_job_id}")
+
+            # Additional safety check - ensure path is within expected directory
+            if not str(cleanup_path).startswith("/trainingresults/"):
+                logfire.error(f"Invalid cleanup path: {cleanup_path}")
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Error cancelling job {user_plus_job_id}: {str(e)}",
+                    detail="Invalid cleanup path",
                 )
-            user_dir, job_id = user_plus_job_id.split("_")
-            with logfire.span("Cleaning up Modal Volume"):
-                checkpoint_volume.reload()
-                if Path(f"/trainingresults/{user_dir}/{job_id}").exists():
-                    shutil.rmtree(Path(f"/trainingresults/{user_dir}/{job_id}"))
-                    logfire.info(
-                        f"Successfully cleaned user {user_dir} job {job_id} from Modal Volume ✅"
-                    )
-                return {
-                    "message": f"User {user_dir} job {job_id} cancelled successfully ✅\n"
-                }
+
+            if cleanup_path.exists():
+                shutil.rmtree(cleanup_path)
+                logfire.info(
+                    f"Successfully cleaned user {safe_user_dir} job {safe_job_id} from Modal Volume ✅"
+                )
+            else:
+                logfire.info(
+                    f"No volume directory found for user {safe_user_dir} job {safe_job_id} (may not have started yet)"
+                )
+
+        # Return success even if job wasn't in queue - we still cleaned up the volume
+        if job_cancelled:
+            return {
+                "message": f"User {safe_user_dir} job {safe_job_id} cancelled successfully ✅\n"
+            }
+        else:
+            return {
+                "message": f"User {safe_user_dir} job {safe_job_id} cleanup completed (job may not have started yet) ✅\n"
+            }

@@ -30,6 +30,13 @@ class CloudBucket:
 
     async def upload_file(self, file_path: Path, s3_key: str):
         """Upload a single file asynchronously"""
+        if ".." in s3_key or s3_key.startswith("/"):
+            raise ValueError(f"Invalid s3_key format: {s3_key}")
+
+        # Validate file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
         async with self.session.client(
             "s3",
             endpoint_url=self.endpoint_url,
