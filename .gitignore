@@ -10,3 +10,6 @@ wheels/
 .venv
 data/
 .env
+
+curltrain.sh
+curlcancel.sh
